@@ -1,0 +1,489 @@
+---
+title: "R Notebook"
+output: html_notebook
+Author: "AIT TAYEB Lyes
+         DZIRI Rayane
+         HAMMA Sofiane
+         COODIEN Govindarajen "
+---
+#Préparation de l’environnement R et MongoDB
+```{r}
+# Installation (à faire une fois)
+install.packages(c("dplyr","tidyr","stringr","readr","lubridate",
+                   "ggplot2","mongolite","DBI","purrr","shiny"))
+
+# Chargement
+library(dplyr); library(tidyr); library(stringr); library(readr)
+library(lubridate); library(ggplot2); library(mongolite); library(DBI)
+library(purrr); library(shiny)
+
+```
+
+```{r}
+library(readxl)
+airports <- read_excel("airports.xlsx")
+head(airports)
+
+
+```
+```{r}
+library(jsonlite)
+airlines <- fromJSON("airlines.json")
+head(airlines)
+```
+
+```{r}
+flights <- read_excel("flights.xlsx")
+head(flights)
+
+```
+
+
+```{r}
+# planes.html (table HTML) — on extrait la/les tables
+planes_html <- xml2::read_html("planes.html")
+planes_tables <- rvest::html_table(planes_html, fill = TRUE)
+# Si plusieurs tables, choisis la bonne (souvent la 1ère) :
+planes <- planes_tables[[1]]
+```
+
+```{r}
+
+
+# Charger et lire le PDF
+library(pdftools)
+pdf_text <- pdf_text("weather.pdf")
+
+# Afficher le texte brut de la première page
+weather <- readr::read_csv(pdf_text)
+
+# Vérification
+head(weather)
+
+```
+
+```{r}
+
+
+uri <- "mongodb://127.0.0.1:27017"
+db_name <- "adp_bts"
+
+flights_col  <- mongolite::mongo(collection = "flights",  url = uri, db = db_name)
+airports_col <- mongolite::mongo(collection = "airports", url = uri, db = db_name)
+airlines_col <- mongolite::mongo(collection = "airlines", url = uri, db = db_name)
+planes_col   <- mongolite::mongo(collection = "planes",   url = uri, db = db_name)
+weather_col  <- mongolite::mongo(collection = "weather",  url = uri, db = db_name)
+
+```
+
+
+```{r}
+# Exemple direct
+airlines_col$insert(airlines)
+airports_col$insert(airports)
+planes_col$insert(planes)
+weather_col$insert(weather)
+flights_col$insert(flights)
+
+```
+
+```{r}
+list(
+  airports = airports_col$count(),
+  airlines = airlines_col$count(),
+  planes   = planes_col$count(),
+  weather  = weather_col$count(),
+  flights  = flights_col$count()
+)
+
+```
+```{r}
+library(mongolite)
+
+uri <- "mongodb+srv://ipssi:PASSWORD@cluster0.pod4e.mongodb.net/flights"
+db_name <- "flights"   # le nom de ta base sur Atlas
+
+flights_col  <- mongo(collection = "flights",  url = uri, db = db_name)
+airports_col <- mongo(collection = "airports", url = uri, db = db_name)
+airlines_col <- mongo(collection = "airlines", url = uri, db = db_name)
+planes_col   <- mongo(collection = "planes",   url = uri, db = db_name)
+weather_col  <- mongo(collection = "weather",  url = uri, db = db_name)
+
+```
+
+```{r}
+list(
+  flights  = flights_col$count(),
+  airports = airports_col$count(),
+  airlines = airlines_col$count(),
+  planes   = planes_col$count(),
+  weather  = weather_col$count()
+)
+
+```
+#Compteurs clés:
+
+```{r}
+# Aéroports
+n_airports_total  <- airports_col$count()
+n_airports_origin <- flights_col$aggregate('[{"$group":{"_id":"$origin"}},{"$count":"count"}]')$count
+n_airports_dest   <- flights_col$aggregate('[{"$group":{"_id":"$dest"}},{"$count":"count"}]')$count
+
+# DST = "N" (no daylight saving)
+n_airports_no_dst <- airports_col$aggregate('[{"$match":{"dst":"N"}},{"$count":"count"}]')$count
+
+# Fuseaux horaires distincts (tzone)
+n_tzones <- airports_col$aggregate('[{"$group":{"_id":"$tzone"}},{"$count":"count"}]')$count
+
+# Compagnies, avions
+n_companies <- airlines_col$count()
+n_planes    <- planes_col$count()
+
+# Vols annulés: si pas de colonne "cancelled", proxy: dep_time et arr_time manquants
+n_cancelled <- flights_col$aggregate('[{"$match":{"dep_time":null,"arr_time":null}},{"$count":"count"}]')$count
+
+list(
+  airports_total = n_airports_total,
+  airports_origin = n_airports_origin,
+  airports_dest = n_airports_dest,
+  airports_no_dst = n_airports_no_dst,
+  timezones = n_tzones,
+  companies = n_companies,
+  planes = n_planes,
+  cancelled_flights = n_cancelled
+)
+
+```
+#2. Aéroport de départ le plus emprunté, top/bottom destinations, top/bottom avions
+
+```{r}
+# Aéroport de départ le plus emprunté
+top_origin <- flights_col$aggregate('[{"$group":{"_id":"$origin","n":{"$sum":1}}},{"$sort":{"n":-1}},{"$limit":1}]')
+
+# Comptages par destination
+dest_counts <- flights_col$aggregate('[{"$group":{"_id":"$dest","n":{"$sum":1}}}]') %>% as.data.frame()
+
+# Ajout des noms complets et pourcentages
+airports_df <- airports_col$find() %>% as.data.frame()
+dest_counts <- dest_counts %>%
+  left_join(airports_df %>% select(faa, name), by = c("_id" = "faa")) %>%
+  mutate(pct = n / sum(n)) %>%
+  arrange(desc(n))
+
+top10_dest    <- dest_counts %>% slice(1:10)
+bottom10_dest <- dest_counts %>% arrange(n) %>% slice(1:10)
+
+# Avions (par tailnum)
+plane_counts <- flights_col$aggregate('[{"$group":{"_id":"$tailnum","n":{"$sum":1}}}]') %>% as.data.frame()
+plane_counts <- plane_counts %>% filter(!is.na(`_id`))
+
+top10_planes    <- plane_counts %>% arrange(desc(n)) %>% slice(1:10)
+bottom10_planes <- plane_counts %>% arrange(n) %>% slice(1:10)
+
+list(
+  top_origin = top_origin,
+  top10_dest = top10_dest,
+  bottom10_dest = bottom10_dest,
+  top10_planes = top10_planes,
+  bottom10_planes = bottom10_planes
+)
+
+```
+
+#Destinations par compagnie et par aéroport d’origine, avec graphiques
+```{r}
+library(ggplot2)
+# Destinations uniques par compagnie
+company_dest <- flights_col$find() %>% as.data.frame() %>%
+  distinct(carrier, dest) %>%
+  count(carrier, name = "n_dest") %>%
+  left_join(airlines_col$find() %>% as.data.frame(), by = "carrier")
+
+# Destinations par compagnie et par origin
+company_dest_by_origin <- flights_col$find() %>% as.data.frame() %>%
+  distinct(carrier, origin, dest) %>%
+  count(carrier, origin, name = "n_dest") %>%
+  left_join(airlines_col$find() %>% as.data.frame(), by = "carrier")
+
+# Graphique 1: nombre de destinations par compagnie
+ggplot(company_dest, aes(x = reorder(name, n_dest), y = n_dest)) +
+  geom_col(fill = "#2C7FB8") + coord_flip() +
+  labs(title = "Nombre de destinations par compagnie", x = "Compagnie", y = "Destinations")
+
+# Graphique 2: destinations par compagnie et aéroport d'origine
+ggplot(company_dest_by_origin, aes(x = origin, y = n_dest, fill = name)) +
+  geom_col(position = "dodge") +
+  labs(title = "Destinations par compagnie et aéroport d'origine", x = "Aéroport d'origine", y = "Destinations") +
+  theme(legend.position = "bottom")
+
+```
+#4. Vols vers Houston, NYC → Seattle, compagnies et avions uniques
+
+```{r}
+# Vols vers Houston (IAH ou HOU)
+flights_houston <- flights_col$find('{"dest":{"$in":["IAH","HOU"]}}') %>% as.data.frame()
+n_flights_houston <- nrow(flights_houston)
+
+# Vols de NYC (JFK/LGA/EWR) vers Seattle (SEA)
+nyc_to_sea <- flights_col$find('{"origin":{"$in":["JFK","LGA","EWR"]},"dest":"SEA"}') %>% as.data.frame()
+
+n_nyc_to_sea <- nrow(nyc_to_sea)
+n_companies_sea <- nyc_to_sea %>% distinct(carrier) %>% nrow()
+n_unique_planes_sea <- nyc_to_sea %>% filter(!is.na(tailnum)) %>% distinct(tailnum) %>% nrow()
+
+list(
+  flights_to_houston = n_flights_houston,
+  nyc_to_sea = n_nyc_to_sea,
+  companies_to_sea = n_companies_sea,
+  unique_planes_to_sea = n_unique_planes_sea
+)
+
+```
+#5. Nombre de vols par destination et tri alphabétique avec noms explicites
+```{r}
+# Nombre de vols par destination
+flights_by_dest <- flights_col$aggregate('[{"$group":{"_id":"$dest","n":{"$sum":1}}},{"$sort":{"n":-1}}]') %>% as.data.frame()
+flights_by_dest <- flights_by_dest %>%
+  left_join(airports_df %>% select(faa, name), by = c("_id" = "faa")) %>%
+  arrange(desc(n))
+
+# Tri alphabétique par destination (nom), aéroport d'origine (nom), compagnie (nom)
+flights_df <- flights_col$find() %>% as.data.frame()
+airlines_df <- airlines_col$find() %>% as.data.frame()
+
+tri_alpha <- flights_df %>%
+  left_join(airports_df %>% select(faa, name), by = c("origin" = "faa")) %>%
+  rename(origin_name = name) %>%
+  left_join(airports_df %>% select(faa, name), by = c("dest" = "faa")) %>%
+  rename(dest_name = name) %>%
+  left_join(airlines_df, by = "carrier") %>%
+  arrange(dest_name, origin_name, name) %>%
+  select(dest_name, origin_name, name, year, month, day, flight)
+
+```
+#6. Couverture des compagnies et tableau origines/destinations
+```{r}
+# Récupération des dataframes
+flights_df  <- flights_col$find()   %>% as.data.frame()
+airports_df <- airports_col$find()  %>% as.data.frame()
+airlines_df <- airlines_col$find()  %>% as.data.frame()
+
+# Liste complète des origines et destinations
+origins_all <- unique(flights_df$origin)
+dests_all   <- unique(flights_df$dest)
+
+# --- Couverture des origines par compagnie ---
+coverage_origin <- flights_df %>%
+  distinct(carrier, origin) %>%
+  count(carrier, name = "n_origins") %>%
+  mutate(total_origins = length(origins_all),
+         full_coverage = n_origins == total_origins) %>%
+  left_join(airlines_df %>% rename(airline_name = name), by = "carrier")
+
+companies_not_all_origins <- coverage_origin %>% filter(!full_coverage)
+
+# --- Couverture des destinations par compagnie ---
+coverage_dest <- flights_df %>%
+  distinct(carrier, dest) %>%
+  count(carrier, name = "n_dests") %>%
+  mutate(total_dests = length(dests_all),
+         full_coverage = n_dests == total_dests) %>%
+  left_join(airlines_df %>% rename(airline_name = name), by = "carrier")
+
+companies_all_dests <- coverage_dest %>% filter(full_coverage)
+
+# --- Tableau global origines/destinations par compagnie ---
+company_origin_dest_table <- flights_df %>%
+  left_join(airlines_df %>% rename(airline_name = name), by = "carrier") %>%
+  left_join(airports_df %>% select(faa, name) %>% rename(origin_name = name), 
+            by = c("origin" = "faa")) %>%
+  left_join(airports_df %>% select(faa, name) %>% rename(dest_name = name), 
+            by = c("dest" = "faa")) %>%
+  distinct(airline_name, origin_name, dest_name) %>%
+  arrange(airline_name, origin_name, dest_name)
+
+# Résultats
+list(
+  companies_not_all_origins = companies_not_all_origins,
+  companies_all_dests = companies_all_dests,
+  company_origin_dest_table = head(company_origin_dest_table, 20) # aperçu
+)
+
+```
+
+#7. Destinations exclusives à certaines compagnies
+```{r}
+# Récupération des dataframes
+flights_df  <- flights_col$find()   %>% as.data.frame()
+airports_df <- airports_col$find()  %>% as.data.frame()
+airlines_df <- airlines_col$find()  %>% as.data.frame()
+
+# Compter combien de compagnies desservent chaque destination
+dest_company_counts <- flights_df %>%
+  distinct(dest, carrier) %>%
+  add_count(dest, name = "n_carriers")
+
+# Filtrer les destinations exclusives (une seule compagnie)
+exclusive_dests <- dest_company_counts %>%
+  filter(n_carriers == 1) %>%
+  left_join(airports_df %>% select(faa, name), by = c("dest" = "faa")) %>%
+  left_join(airlines_df %>% rename(airline_name = name), by = "carrier") %>%
+  select(dest, airport_name = name, carrier, airline_name) %>%
+  distinct() %>%
+  arrange(airport_name)
+
+# Aperçu des 20 premières
+head(exclusive_dests, 20)
+
+# --- Graphique : nombre de destinations exclusives par compagnie ---
+exclusive_summary <- exclusive_dests %>%
+  count(airline_name, name = "n_exclusive")
+
+ggplot(exclusive_summary, aes(x = reorder(airline_name, n_exclusive), y = n_exclusive)) +
+  geom_col(fill = "#D95F0E") +
+  coord_flip() +
+  labs(title = "Destinations exclusives par compagnie",
+       x = "Compagnie",
+       y = "Nombre de destinations exclusives")
+
+```
+#8. Vols exploités par United, American ou Delta
+```{r}
+uad <- flights_col$find('{"carrier":{"$in":["UA","AA","DL"]}}') %>% as.data.frame()
+# Aperçu
+uad %>% select(year, month, day, origin, dest, carrier, flight) %>% head(20)
+
+```
+
+
+
+
+
+
+#Mission2
+
+#Sécurisation de la connexion Atlas
+```{r}
+library(mongolite)
+library(dplyr)
+library(stringr)
+readRenviron(".Renviron")
+# Connexion sécurisée
+uri <- Sys.getenv("MONGO_URI")
+db_name <- Sys.getenv("MONGO_DB")
+
+flights_col  <- mongo("flights",  url = uri, db = db_name)
+airports_col <- mongo("airports", url = uri, db = db_name)
+airlines_col <- mongo("airlines", url = uri, db = db_name)
+planes_col   <- mongo("planes",   url = uri, db = db_name)
+weather_col  <- mongo("weather",  url = uri, db = db_name)
+
+# Charger en dataframes
+flights_df  <- flights_col$find()
+airports_df <- airports_col$find()
+airlines_df <- airlines_col$find()
+planes_df   <- planes_col$find()
+weather_df  <- weather_col$find()
+
+```
+
+#1 Vérification des clés primaires
+```{r}
+library(stringr)
+
+# Regex helpers
+is_iata   <- function(x) str_detect(x, "^[A-Z]{3}$")
+is_carrier<- function(x) str_detect(x, "^[A-Z0-9]{2}$")
+is_tail   <- function(x) str_detect(x, "^N[0-9]{1,5}[A-Z]{0,2}$")
+
+# Vérifs
+bad_airports <- airports_df %>% filter(!is_iata(faa))
+bad_carrier  <- airlines_df %>% filter(!is_carrier(carrier))
+bad_tail     <- planes_df   %>% filter(!is_tail(tailnum))
+
+# Unicité composite flights
+dup_flights <- flights_df %>%
+  count(year, month, day, hour, carrier, flight, name = "n") %>%
+  filter(n > 1)
+
+list(
+  bad_airports = bad_airports,
+  bad_carrier  = bad_carrier,
+  bad_tail     = head(bad_tail, 10),
+  duplicate_flights = nrow(dup_flights)
+)
+
+```
+#Vérification des clés étrangères
+```{r}
+missing_airports_dest <- flights_df %>%
+  distinct(dest) %>%
+  anti_join(airports_df %>% select(faa), by = c("dest"="faa"))
+
+missing_airports_origin <- flights_df %>%
+  distinct(origin) %>%
+  anti_join(airports_df %>% select(faa), by = c("origin"="faa"))
+
+missing_tailnums <- flights_df %>%
+  distinct(tailnum) %>%
+  filter(!is.na(tailnum)) %>%
+  anti_join(planes_df %>% select(tailnum), by = "tailnum")
+
+missing_carriers <- flights_df %>%
+  distinct(carrier) %>%
+  anti_join(airlines_df %>% select(carrier), by = "carrier")
+
+list(
+  missing_dest_airports = missing_airports_dest,
+  missing_origin_airports = missing_airports_origin,
+  missing_tailnums = head(missing_tailnums, 20),
+  missing_carriers = missing_carriers
+)
+
+```
+#Création des index
+```{r}
+# Airports
+airports_col$run('{"createIndexes":"airports","indexes":[{"key":{"faa":1},"name":"faa_1"}]}')
+
+# Airlines
+airlines_col$run('{"createIndexes":"airlines","indexes":[{"key":{"carrier":1},"name":"carrier_1"}]}')
+
+# Planes
+planes_col$run('{"createIndexes":"planes","indexes":[{"key":{"tailnum":1},"name":"tailnum_1"}]}')
+
+# Weather (composite)
+weather_col$run('{
+  "createIndexes":"weather",
+  "indexes":[{"key":{"origin":1,"year":1,"month":1,"day":1,"hour":1},"name":"origin_year_month_day_hour"}]
+}')
+
+# Flights (composite)
+flights_col$run('{
+  "createIndexes":"flights",
+  "indexes":[{"key":{"year":1,"month":1,"day":1,"hour":1,"carrier":1,"flight":1},"name":"ymdh_carrier_flight"}]
+}')
+
+
+
+```
+```{r}
+airports_col$run('{ "listIndexes": "airports" }')
+airlines_col$run('{ "listIndexes": "airlines" }')
+planes_col$run('{ "listIndexes": "planes" }')
+weather_col$run('{ "listIndexes": "weather" }')
+flights_col$run('{ "listIndexes": "flights" }')
+
+```
+
+#Documentation des anomalies
+```{r}
+issues_airports_col <- mongo("issues_missing_airports", url = uri, db = db_name)
+issues_tailnums_col <- mongo("issues_missing_tailnums", url = uri, db = db_name)
+
+issues_airports_col$insert(missing_airports_dest)
+issues_tailnums_col$insert(missing_tailnums)
+
+
+```
+

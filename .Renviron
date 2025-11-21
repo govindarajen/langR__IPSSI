@@ -1,0 +1,2 @@
+MONGO_URI=mongodb+srv://ipssi:PASSWORD@cluster0.pod4e.mongodb.net
+MONGO_DB=flights

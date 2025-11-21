@@ -1,0 +1,555 @@
+---
+title: "R Notebook"
+output: html_notebook
+Author: "AIT TAYEB Lyes
+         DZIRI Rayane
+         HAMMA Sofiane
+         COODIEN Govindarajen "
+---
+
+```{r}
+# app.R
+
+# ---- Packages ----
+library(shiny)
+library(mongolite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(lubridate)
+library(stringr)
+library(scales)
+library(leaflet)
+
+# ---- Helpers ----
+`%||%` <- function(a, b) {
+  if (is.null(a)) return(b)
+  if (is.character(a)) {
+    a[is.na(a) | a == ""] <- b
+    return(a)
+  }
+  ifelse(is.na(a), b, a)
+}
+safe_hour <- function(x_hhmm) {
+  suppressWarnings({
+    x <- as.numeric(x_hhmm)
+    h <- floor(x / 100)
+    h[h < 0 | h > 23] <- NA
+    h
+  })
+}
+safe_minute <- function(x_hhmm) {
+  suppressWarnings({
+    x <- as.numeric(x_hhmm)
+    m <- x %% 100
+    m[m < 0 | m > 59] <- NA
+    m
+  })
+}
+make_datetime <- function(y, m, d, hh, mm) {
+  suppressWarnings({
+    y <- as.integer(y); m <- as.integer(m); d <- as.integer(d)
+    hh <- as.integer(hh); mm <- as.integer(mm)
+    ok <- !is.na(y) & !is.na(m) & !is.na(d) & !is.na(hh) & !is.na(mm)
+    out <- rep(NA_character_, length(y))
+    out[ok] <- sprintf("%04d-%02d-%02d %02d:%02d:00", y[ok], m[ok], d[ok], hh[ok], mm[ok])
+    as.POSIXct(out, tz = "UTC")
+  })
+}
+
+# ---- Connexion MongoDB Atlas (sécurisée) ----
+# Assure-toi d'avoir .Renviron dans le dossier du projet
+# avec MONGO_URI=... et MONGO_DB=...
+readRenviron(".Renviron")
+
+uri <- Sys.getenv("MONGO_URI")
+db_name <- Sys.getenv("MONGO_DB")
+if (identical(uri, "") || identical(db_name, "")) {
+  stop("Variables MONGO_URI/MONGO_DB introuvables. Place .Renviron dans le projet et relance.")
+}
+
+flights_col  <- mongo("flights",  url = uri, db = db_name)
+airports_col <- mongo("airports", url = uri, db = db_name)
+airlines_col <- mongo("airlines", url = uri, db = db_name)
+planes_col   <- mongo("planes",   url = uri, db = db_name)
+weather_col  <- mongo("weather",  url = uri, db = db_name)
+
+# ---- Chargement initial ----
+airports_df <- airports_col$find() %>% as.data.frame()
+airlines_df <- airlines_col$find() %>% as.data.frame()
+planes_df   <- planes_col$find()   %>% as.data.frame()
+flights_df  <- flights_col$find()  %>% as.data.frame()
+
+# ---- Nettoyage / enrichissements ----
+# Harmonise types, calcule heures/minutes, reconstitue datetimes de manière robuste
+flights_df <- flights_df %>%
+  mutate(
+    dep_delay = suppressWarnings(as.numeric(dep_delay)),
+    arr_delay = suppressWarnings(as.numeric(arr_delay)),
+    air_time  = suppressWarnings(as.numeric(air_time)),
+    distance  = suppressWarnings(as.numeric(distance)),
+    cancelled = if_else(is.na(dep_time) & is.na(arr_time), TRUE, FALSE),
+    time_hour = suppressWarnings(ymd_hms(time_hour, quiet = TRUE)) # si présent
+  ) %>%
+  mutate(
+    # Heures/minutes réelles
+    dep_hour = safe_hour(dep_time),
+    dep_min  = safe_minute(dep_time),
+    arr_hour = safe_hour(arr_time),
+    arr_min  = safe_minute(arr_time),
+    # Heures/minutes planifiées
+    sched_dep_hour = if ("sched_dep_time" %in% names(.)) safe_hour(sched_dep_time) else NA,
+    sched_dep_min  = if ("sched_dep_time" %in% names(.)) safe_minute(sched_dep_time) else NA,
+    sched_arr_hour = if ("sched_arr_time" %in% names(.)) safe_hour(sched_arr_time) else NA,
+    sched_arr_min  = if ("sched_arr_time" %in% names(.)) safe_minute(sched_arr_time) else NA
+  ) %>%
+  mutate(
+    # Datetime planifié départ
+    sched_dep_datetime = if (all(c("year","month","day","sched_dep_hour","sched_dep_min") %in% names(.))) {
+      make_datetime(year, month, day, sched_dep_hour, sched_dep_min)
+    } else {
+      NA
+    },
+    # Datetime planifié arrivée
+    sched_arr_datetime = if (all(c("year","month","day","sched_arr_hour","sched_arr_min") %in% names(.))) {
+      make_datetime(year, month, day, sched_arr_hour, sched_arr_min)
+    } else {
+      NA
+    },
+    # Datetime réel départ
+    dep_datetime = if (all(c("year","month","day","dep_hour","dep_min") %in% names(.))) {
+      make_datetime(year, month, day, dep_hour, dep_min)
+    } else {
+      NA
+    },
+    # Datetime réel arrivée
+    arr_datetime = if (all(c("year","month","day","arr_hour","arr_min") %in% names(.))) {
+      make_datetime(year, month, day, arr_hour, arr_min)
+    } else {
+      NA
+    }
+  )
+
+airports_ref <- airports_df %>% select(faa, name, lat, lon)
+airlines_ref <- airlines_df %>% select(carrier, name)
+
+# ---- UI ----
+ui <- fluidPage(
+  titlePanel("Trafic aérien – Dashboard complet (Reporting & Prédictif)"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("carrier", "Compagnie :", choices = c("Toutes", sort(unique(flights_df$carrier))), selected = "Toutes"),
+      selectInput("origin",  "Aéroport de départ :", choices = c("Tous", sort(unique(flights_df$origin))), selected = "Tous"),
+      selectInput("dest",    "Aéroport d’arrivée :", choices = c("Tous", sort(unique(flights_df$dest))), selected = "Tous"),
+      uiOutput("dateRangeUI"),
+      sliderInput("depHour", "Heure de départ :", min = 0, max = 23, value = c(0, 23), step = 1),
+      checkboxInput("excludeCancelled", "Exclure vols annulés", value = FALSE),
+      actionButton("applyFilters", "Appliquer les filtres", icon = icon("filter")),
+      hr(),
+      checkboxInput("showAverages", "Afficher les moyennes/bandes sur les graphes", value = TRUE)
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("KPI",
+          fluidRow(
+            column(2, wellPanel(h5("Vols"), textOutput("kpi_flights"))),
+            column(2, wellPanel(h5("Annulations"), textOutput("kpi_cancelled"))),
+            column(2, wellPanel(h5("Retard départ (moy)"), textOutput("kpi_dep_delay"))),
+            column(2, wellPanel(h5("Retard arrivée (moy)"), textOutput("kpi_arr_delay"))),
+            column(2, wellPanel(h5("Compagnies"), textOutput("kpi_carriers"))),
+            column(2, wellPanel(h5("Destinations"), textOutput("kpi_dests")))
+          ),
+          DTOutput("table_sample")
+        ),
+        tabPanel("Trafic temporel",
+          plotlyOutput("plot_monthly_by_origin_facets"),
+          plotlyOutput("plot_monthly_growth"),
+          DTOutput("table_monthly_traffic"),
+          hr(),
+          h5("Jours spéciaux"),
+          DTOutput("table_special_days"),
+          plotlyOutput("plot_weekday_vs_weekend")
+        ),
+        tabPanel("Retards & fiabilité",
+          plotlyOutput("plot_top_delays_dep"),
+          plotlyOutput("plot_top_delays_arr"),
+          plotlyOutput("plot_quality_by_carrier_dest"),
+          DTOutput("table_delay_stats"),
+          plotlyOutput("plot_gain_speed")
+        ),
+        tabPanel("Distance vs retard",
+          plotlyOutput("plot_distance_delay"),
+          DTOutput("table_distance_delay"),
+          h6("Note: HNL est exclu des graphes (outlier).")
+        ),
+        tabPanel("Annulations & NA",
+          DTOutput("table_na_proportions"),
+          plotlyOutput("plot_cancel_by_carrier"),
+          plotlyOutput("plot_cancel_by_dest"),
+          DTOutput("table_cancel_details")
+        ),
+        tabPanel("Carte O/D",
+          leafletOutput("map_routes", height = 600),
+          DTOutput("table_top_routes")
+        )
+      )
+    )
+  )
+)
+
+# ---- Server ----
+server <- function(input, output, session) {
+
+  # Plage de dates
+  output$dateRangeUI <- renderUI({
+    base_dates <- if (any(!is.na(flights_df$sched_dep_datetime))) flights_df$sched_dep_datetime else flights_df$time_hour
+    rng <- range(base_dates, na.rm = TRUE)
+    dateRangeInput("dateRange", "Plage de dates :", start = as.Date(rng[1]), end = as.Date(rng[2]),
+                   min = as.Date(rng[1]), max = as.Date(rng[2]))
+  })
+
+  # Filtrage global
+  filtered <- eventReactive(input$applyFilters, {
+    df <- flights_df %>%
+      mutate(
+        base_datetime = if (any(!is.na(sched_dep_datetime))) sched_dep_datetime else time_hour,
+        date = as.Date(base_datetime),
+        hour = dep_hour
+      )
+
+    if (input$carrier != "Toutes") df <- df %>% filter(carrier == input$carrier)
+    if (input$origin  != "Tous")   df <- df %>% filter(origin == input$origin)
+    if (input$dest    != "Tous")   df <- df %>% filter(dest == input$dest)
+
+    if (!is.null(input$dateRange) && length(input$dateRange) == 2) {
+      df <- df %>% filter(!is.na(date), date >= input$dateRange[1], date <= input$dateRange[2])
+    }
+
+    df <- df %>% filter(is.na(hour) | (hour >= input$depHour[1] & hour <= input$depHour[2]))
+
+    if (isTRUE(input$excludeCancelled)) {
+      df <- df %>% filter(!cancelled)
+    }
+
+    df
+  }, ignoreInit = FALSE)
+
+  # KPI
+  output$kpi_flights <- renderText({ nrow(filtered()) })
+  output$kpi_cancelled <- renderText({ sum(filtered()$cancelled, na.rm = TRUE) })
+  output$kpi_dep_delay <- renderText({
+    val <- mean(filtered()$dep_delay, na.rm = TRUE); if (is.nan(val)) "NA" else round(val, 1)
+  })
+  output$kpi_arr_delay <- renderText({
+    val <- mean(filtered()$arr_delay, na.rm = TRUE); if (is.nan(val)) "NA" else round(val, 1)
+  })
+  output$kpi_carriers <- renderText({ filtered() %>% distinct(carrier) %>% nrow() })
+  output$kpi_dests    <- renderText({ filtered() %>% distinct(dest) %>% nrow() })
+  output$table_sample <- renderDT({
+    filtered() %>% select(year, month, day, carrier, origin, dest, dep_time, arr_time, dep_delay, arr_delay) %>% head(50)
+  })
+
+  # ---- 3.1 Trafic temporel ----
+  monthly_by_origin <- reactive({
+    df <- filtered()
+    base_dt <- if (any(!is.na(df$sched_dep_datetime))) df$sched_dep_datetime else df$time_hour
+    df <- df %>%
+      mutate(month = month(base_dt, label = TRUE),
+             ymonth = floor_date(base_dt, "month")) %>%
+      group_by(origin, ymonth) %>% summarize(n = n(), .groups = "drop") %>%
+      group_by(origin, month = month(ymonth, label = TRUE)) %>%
+      summarize(
+        vols_mois = mean(n, na.rm = TRUE),
+        vols_moy_jour = mean(n / day(days_in_month(ymonth)), na.rm = TRUE),
+        .groups = "drop"
+      )
+    df
+  })
+
+  output$plot_monthly_by_origin_facets <- renderPlotly({
+    df <- monthly_by_origin()
+    validate(need(nrow(df) > 0, "Aucune donnée mensuelle."))
+    p <- ggplot(df, aes(x = month, y = vols_mois)) +
+      geom_col(fill = "#2C7FB8") +
+      facet_wrap(~ origin, ncol = 3, scales = "free_y") +
+      labs(title = "Trafic mensuel par aéroport d'origine",
+           x = "Mois", y = "Nombre de vols") +
+      theme_minimal()
+    if (isTRUE(input$showAverages)) {
+      p <- p + stat_summary(fun = mean, aes(group = 1), geom = "line", color = "red", size = 0.8)
+    }
+    ggplotly(p)
+  })
+
+  output$plot_monthly_growth <- renderPlotly({
+    df <- filtered()
+    base_dt <- if (any(!is.na(df$sched_dep_datetime))) df$sched_dep_datetime else df$time_hour
+    df <- df %>%
+      mutate(ymonth = floor_date(base_dt, "month")) %>%
+      count(origin, ymonth, name = "n") %>%
+      group_by(origin) %>%
+      arrange(ymonth) %>%
+      mutate(growth_rate = (n - lag(n)) / lag(n)) %>%
+      ungroup()
+    validate(need(nrow(df) > 0, "Pas de données pour le taux d'accroissement."))
+    p <- ggplot(df, aes(x = ymonth, y = growth_rate, color = origin)) +
+      geom_line(size = 0.9) +
+      scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+      labs(title = "Taux d'accroissement mensuel du trafic",
+           x = "Mois", y = "Croissance (%)") +
+      theme_minimal()
+    ggplotly(p)
+  })
+
+  output$table_monthly_traffic <- renderDT({
+    monthly_by_origin() %>% arrange(origin, month)
+  })
+
+  # Jours spéciaux
+  output$table_special_days <- renderDT({
+    df <- filtered()
+    base_dt <- if (any(!is.na(df$sched_dep_datetime))) df$sched_dep_datetime else df$time_hour
+    df <- df %>%
+      mutate(date = as.Date(base_dt),
+             holiday = case_when(
+               date == ymd("2013-12-25") ~ "Christmas Day",
+               date == ymd("2013-01-01") ~ "New Year",
+               date == ymd("2013-07-04") ~ "Independence Day",
+               date == ymd("2013-11-29") ~ "Thanksgiving",
+               TRUE ~ NA_character_
+             )) %>%
+      filter(!is.na(holiday)) %>%
+      count(holiday, origin, dest, name = "vols")
+    df
+  })
+
+  output$plot_weekday_vs_weekend <- renderPlotly({
+    df <- filtered()
+    base_dt <- if (any(!is.na(df$sched_dep_datetime))) df$sched_dep_datetime else df$time_hour
+    df <- df %>%
+      mutate(dow = wday(base_dt, label = TRUE),
+             is_weekend = dow %in% c("Sat", "Sun")) %>%
+      count(is_weekend, name = "n")
+    validate(need(nrow(df) > 0, "Pas de données pour semaine vs weekend."))
+    p <- ggplot(df, aes(x = ifelse(is_weekend, "Weekend", "Semaine"), y = n)) +
+      geom_col(fill = "#66C2A5") +
+      labs(title = "Trafic: Semaine vs Weekend", x = "", y = "Vols") +
+      theme_minimal()
+    ggplotly(p)
+  })
+
+  # ---- 3.2 Retards & fiabilité ----
+  output$plot_top_delays_dep <- renderPlotly({
+    df <- filtered() %>%
+      filter(!is.na(dep_delay)) %>%
+      arrange(desc(dep_delay)) %>%
+      head(30)
+    validate(need(nrow(df) > 0, "Pas de données de retard au départ."))
+    p <- ggplot(df, aes(x = reorder(paste(carrier, flight, dest), dep_delay), y = dep_delay)) +
+      geom_col(fill = "#E7298A") + coord_flip() +
+      labs(title = "Top retards au départ", x = "Vol", y = "Retard départ (min)")
+    ggplotly(p)
+  })
+
+  output$plot_top_delays_arr <- renderPlotly({
+    df <- filtered() %>%
+      filter(!is.na(arr_delay)) %>%
+      arrange(desc(arr_delay)) %>%
+      head(30)
+    validate(need(nrow(df) > 0, "Pas de données de retard à l'arrivée."))
+    p <- ggplot(df, aes(x = reorder(paste(carrier, flight, dest), arr_delay), y = arr_delay)) +
+      geom_col(fill = "#7570B3") + coord_flip() +
+      labs(title = "Top retards à l'arrivée", x = "Vol", y = "Retard arrivée (min)")
+    ggplotly(p)
+  })
+
+  output$plot_quality_by_carrier_dest <- renderPlotly({
+    df <- filtered() %>%
+      mutate(delayed15 = dep_delay > 15) %>%
+      group_by(carrier, dest) %>%
+      summarize(p_delayed = mean(delayed15, na.rm = TRUE), n = n(), .groups = "drop") %>%
+      filter(n >= 50) %>%
+      arrange(desc(p_delayed))
+    validate(need(nrow(df) > 0, "Pas de données suffisantes pour l'indicateur de qualité."))
+    p <- ggplot(df, aes(x = reorder(paste(carrier, dest), p_delayed), y = p_delayed)) +
+      geom_col(fill = "#1B9E77") + coord_flip() +
+      scale_y_continuous(labels = percent_format()) +
+      labs(title = "Proportion de vols retardés (>15 min) par compagnie/destination",
+           x = "Compagnie/Destination", y = "Proportion retardée")
+    ggplotly(p)
+  })
+
+  output$table_delay_stats <- renderDT({
+    df <- filtered() %>%
+      summarize(
+        ret_dep_moy = mean(dep_delay, na.rm = TRUE),
+        ret_arr_moy = mean(arr_delay, na.rm = TRUE),
+        vols_2h_arr_on_time_dep = sum(arr_delay > 120 & dep_delay <= 0, na.rm = TRUE),
+        vols_no_big_delay = sum((dep_delay <= 120 | is.na(dep_delay)) & (arr_delay <= 120 | is.na(arr_delay)), na.rm = TRUE),
+        vols_early_dep = sum(dep_delay < 0, na.rm = TRUE),
+        vols_early_arr = sum(arr_delay < 0, na.rm = TRUE),
+        vols_one_hour_dep_gain30 = sum(dep_delay >= 60 & (arr_delay - dep_delay) <= -30, na.rm = TRUE),
+        .groups = "drop"
+      )
+    df
+  })
+
+  output$plot_gain_speed <- renderPlotly({
+    df <- filtered() %>%
+      mutate(gain = arr_delay - dep_delay,
+             speed = if_else(!is.na(distance) & !is.na(air_time) & air_time > 0, distance / air_time * 60, NA_real_)) %>%
+      filter(!is.na(gain) & !is.na(speed))
+    validate(need(nrow(df) > 0, "Pas de données pour gain & vitesse."))
+    p <- ggplot(df, aes(x = speed, y = gain)) +
+      geom_point(alpha = 0.5, color = "#2C7FB8") +
+      labs(title = "Gain vs Vitesse (gain = arr_delay - dep_delay)",
+           x = "Vitesse (miles/h)", y = "Gain (min)") +
+      theme_minimal()
+    ggplotly(p)
+  })
+
+  # ---- 3.3 Distance vs retard ----
+  dist_delay <- reactive({
+    df <- filtered() %>%
+      group_by(dest) %>%
+      summarize(
+        delay_moy = mean(arr_delay, na.rm = TRUE),
+        dist_count = n(),
+        dist_moy = mean(distance, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      filter(!is.na(dist_moy))
+    df %>% filter(dest != "HNL") # exclure outlier
+  })
+
+  output$plot_distance_delay <- renderPlotly({
+    df <- dist_delay()
+    validate(need(nrow(df) > 0, "Pas de données pour distance vs retard."))
+    p <- ggplot(df, aes(x = dist_moy, y = delay_moy, size = dist_count, label = dest)) +
+      geom_point(alpha = 0.7, color = "#D95F02") +
+      geom_smooth(method = "lm", se = TRUE, color = "gray40") +
+      labs(title = "Relation distance vs retard moyen à l'arrivée (Hors HNL)",
+           x = "Distance moyenne (miles)", y = "Retard moyen (min)") +
+      theme_minimal()
+    ggplotly(p)
+  })
+
+  output$table_distance_delay <- renderDT({
+    dist_delay() %>% arrange(desc(delay_moy))
+  })
+
+  # ---- 3.4 Annulations & NA ----
+  output$table_na_proportions <- renderDT({
+    df <- filtered()
+    tibble(
+      var = c("dep_time", "dep_delay", "arr_time", "arr_delay", "tailnum", "air_time"),
+      na_prop = c(
+        mean(is.na(df$dep_time)),
+        mean(is.na(df$dep_delay)),
+        mean(is.na(df$arr_time)),
+        mean(is.na(df$arr_delay)),
+        mean(is.na(df$tailnum)),
+        mean(is.na(df$air_time))
+      )
+    ) %>% mutate(na_prop = percent(na_prop))
+  })
+
+  output$plot_cancel_by_carrier <- renderPlotly({
+    df <- filtered() %>%
+      group_by(carrier) %>%
+      summarize(cancelled = sum(cancelled, na.rm = TRUE), .groups = "drop") %>%
+      left_join(airlines_ref, by = "carrier") %>%
+      mutate(label = name %||% carrier)
+    validate(need(sum(df$cancelled) > 0, "Aucune annulation."))
+    ggplotly(
+      ggplot(df, aes(x = reorder(label, cancelled), y = cancelled)) +
+        geom_col(fill = "#A6761D") + coord_flip() +
+        labs(title = "Annulations par compagnie", x = "Compagnie", y = "Nb annulations")
+    )
+  })
+
+  output$plot_cancel_by_dest <- renderPlotly({
+    df <- filtered() %>%
+      group_by(dest) %>%
+      summarize(cancelled = sum(cancelled, na.rm = TRUE), .groups = "drop") %>%
+      left_join(airports_ref, by = c("dest" = "faa")) %>%
+      mutate(label = name %||% dest)
+    validate(need(sum(df$cancelled) > 0, "Aucune annulation."))
+    ggplotly(
+      ggplot(df, aes(x = reorder(label, cancelled), y = cancelled)) +
+        geom_col(fill = "#7570B3") + coord_flip() +
+        labs(title = "Annulations par destination", x = "Destination", y = "Nb annulations")
+    )
+  })
+
+  output$table_cancel_details <- renderDT({
+    filtered() %>%
+      filter(cancelled) %>%
+      select(carrier, origin, dest, dep_time, arr_time, dep_delay, arr_delay) %>%
+      arrange(carrier, dest)
+  })
+
+  # ---- Carte O/D ----
+  routes_data <- reactive({
+    df <- filtered() %>%
+      left_join(airports_ref %>% rename(origin_name = name, origin_lat = lat, origin_lon = lon),
+                by = c("origin" = "faa")) %>%
+      left_join(airports_ref %>% rename(dest_name = name, dest_lat = lat, dest_lon = lon),
+                by = c("dest" = "faa")) %>%
+      filter(!is.na(origin_lon), !is.na(origin_lat), !is.na(dest_lon), !is.na(dest_lat))
+    df
+  })
+
+  output$map_routes <- renderLeaflet({
+    df <- routes_data()
+    validate(need(nrow(df) > 0, "Pas de routes avec coordonnées pour les filtres."))
+    m <- leaflet() %>% addTiles() %>% setView(lng = -95, lat = 37, zoom = 4)
+    if (nrow(df) <= 2000) {
+      for (i in seq_len(nrow(df))) {
+        m <- addPolylines(m,
+                          lng = c(df$origin_lon[i], df$dest_lon[i]),
+                          lat = c(df$origin_lat[i], df$dest_lat[i]),
+                          weight = 1,
+                          color = "#2C7FB8",
+                          opacity = 0.5)
+      }
+    } else {
+      # agrégation pour grands volumes
+      routes <- df %>%
+        count(origin_lon, origin_lat, dest_lon, dest_lat, name = "n")
+      for (i in seq_len(nrow(routes))) {
+        m <- addPolylines(m,
+                          lng = c(routes$origin_lon[i], routes$dest_lon[i]),
+                          lat = c(routes$origin_lat[i], routes$dest_lat[i]),
+                          weight = pmin(1 + log1p(routes$n[i]), 6),
+                          color = "#2C7FB8",
+                          opacity = 0.5)
+      }
+    }
+    m <- addCircleMarkers(m, lng = df$origin_lon, lat = df$origin_lat,
+                          radius = 2, color = "#1B9E77", stroke = FALSE, fillOpacity = 0.8)
+    m <- addCircleMarkers(m, lng = df$dest_lon, lat = df$dest_lat,
+                          radius = 2, color = "#D95F02", stroke = FALSE, fillOpacity = 0.8)
+    m
+  })
+
+  output$table_top_routes <- renderDT({
+    routes_data() %>%
+      count(origin, dest, name = "n") %>%
+      arrange(desc(n)) %>%
+      left_join(airports_ref %>% rename(origin_name = name), by = c("origin" = "faa")) %>%
+      left_join(airports_ref %>% rename(dest_name = name),   by = c("dest"   = "faa")) %>%
+      mutate(origin_label = origin_name %||% origin, dest_label = dest_name %||% dest) %>%
+      select(origin_label, dest_label, n) %>%
+      head(100)
+  })
+}
+
+shinyApp(ui, server)
+
+```
+
+
+
